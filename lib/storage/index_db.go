@@ -1731,22 +1731,79 @@ func (db *indexDB) SearchTSIDs(qt *querytracer.Tracer, tfss []*TagFilters, tr Ti
 	qt = qt.NewChild("search TSIDs: filters=%s, timeRange=%s, maxMetrics=%d", tfss, &tr, maxMetrics)
 	defer qt.Done()
 
-	metricIDs, err := db.searchMetricIDs(qt, tfss, tr, maxMetrics, deadline)
+	if tr == globalIndexTimeRange {
+		qtChild := qt.NewChild("search for TSIDs in global index: filters=%s", tfss)
+		tsids, err := db.searchTSIDsWithFiltersOnDate(qtChild, tfss, globalIndexDate, maxMetrics, deadline)
+		qtChild.Done()
+		if err != nil {
+			return nil, db.wrapError("search TSIDs", err)
+		}
+		return tsids, nil
+	}
+
+	minDate, maxDate := tr.DateRange()
+	numDays := maxDate - minDate + 1
+
+	if numDays == 1 {
+		qtChild := qt.NewChild("search for TSIDs in per-day index: filters=%s, date=%s", tfss, dateToString(minDate))
+		tsids, err := db.searchTSIDsWithFiltersOnDate(qtChild, tfss, minDate, maxMetrics, deadline)
+		qtChild.Done()
+		if err != nil {
+			return nil, db.wrapError("search TSIDs", err)
+		}
+		return tsids, nil
+	}
+
+	wg := getWaitGroup()
+	errs := make([]error, numDays)
+	tsids := make([][]TSID, numDays)
+	qt = qt.NewChild("parallel search for TSIDs in per-day index: filters=%s, timeRange=%s", tfss, &tr)
+	for date := minDate; date <= maxDate; date++ {
+		day := date - minDate
+		qtChild := qt.NewChild("search for TSIDs: filters=%s, date=%s", tfss, dateToString(date))
+		wg.Go(func() {
+			defer qtChild.Done()
+			tsids[day], errs[day] = db.searchTSIDsWithFiltersOnDate(qtChild, tfss, date, maxMetrics, deadline)
+		})
+	}
+	wg.Wait()
+	putWaitGroup(wg)
+
+	for d := range numDays {
+		err := errs[d]
+		if err != nil {
+			return nil, db.wrapError("search TSIDs", err)
+		}
+	}
+
+	all := mergeSortedTSIDs(tsids)
+	if len(all) > maxMetrics {
+		return nil, db.wrapError("search TSIDs", errTooManyTimeseries(maxMetrics))
+	}
+	return all, nil
+}
+
+func (db *indexDB) searchTSIDsWithFiltersOnDate(qt *querytracer.Tracer, tfss []*TagFilters, date uint64, maxMetrics int, deadline uint64) ([]TSID, error) {
+	is := db.getIndexSearch(deadline)
+	defer db.putIndexSearch(is)
+	// TODO: sort them?
+	metricIDs, err := is.searchMetricIDsWithFiltersOnDate(qt, tfss, date, maxMetrics)
 	if err != nil {
-		return nil, db.wrapError("search TSIDs", err)
+		return nil, err
 	}
-	if metricIDs.Len() == 0 {
-		return nil, nil
-	}
+
+	dmis := db.getDeletedMetricIDs()
 
 	tsids := make([]TSID, metricIDs.Len())
 	metricIDsToDelete := &uint64set.Set{}
 	i := 0
 	paceLimiter := 0
-	is := db.getIndexSearch(deadline)
-	defer db.putIndexSearch(is)
 	metricIDs.ForEach(func(metricIDs []uint64) bool {
 		for _, metricID := range metricIDs {
+			if dmis.Has(metricID) {
+				continue
+			}
+
 			if paceLimiter&paceLimiterSlowIterationsMask == 0 {
 				if err = checkSearchDeadlineAndPace(deadline); err != nil {
 					return false
@@ -1852,22 +1909,21 @@ func (db *indexDB) SearchMetricNames(qt *querytracer.Tracer, tfss []*TagFilters,
 	wg.Wait()
 	putWaitGroup(wg)
 
-	var numMetrics int
+	var total int
 	for d := range numDays {
 		err := errs[d]
 		if err != nil {
 			return nil, db.wrapError("search metric names", err)
 		}
-		numMetrics += len(metricNames[d])
-		if numMetrics > maxMetrics {
-			if numMetrics > maxMetrics {
-				err = errTooManyTimeseries(maxMetrics)
-				return nil, db.wrapError("search metric names", err)
-			}
+		total += len(metricNames[d])
+		// TODO: metrics that exist on several days can be counted twice.
+		if total > maxMetrics {
+			err = errTooManyTimeseries(maxMetrics)
+			return nil, db.wrapError("search metric names", err)
 		}
 	}
 
-	all := make([]string, 0, numMetrics)
+	all := make([]string, 0, total)
 	for _, s := range metricNames {
 		all = append(all, s...)
 	}
@@ -1884,7 +1940,7 @@ func (db *indexDB) searchMetricNamesWithFiltersOnDate(qt *querytracer.Tracer, tf
 		return nil, err
 	}
 
-	dmis := is.db.getDeletedMetricIDs()
+	dmis := db.getDeletedMetricIDs()
 
 	metricNames := make([]string, 0, metricIDs.Len())
 	metricIDsToDelete := &uint64set.Set{}
