@@ -932,7 +932,7 @@ func TestStorageDeleteSeries_CachesAreUpdatedOrReset(t *testing.T) {
 		}
 		minDate, maxDate := tr.DateRange()
 		for date := minDate; date <= maxDate; date++ {
-			tfssKey := marshalTagFiltersKey2(nil, tfss, date)
+			tfssKey := marshalTagFiltersKey(nil, tfss, date)
 			_, got := idb.getMetricIDsFromTagFiltersCache(nil, tfssKey)
 			if got != want {
 				t.Errorf("unexpected tag filters in cache %v %s: got %t, want %t", tfss, dateToString(date), got, want)
@@ -3578,8 +3578,8 @@ func testStorageAddRowsWithZeroDate(t *testing.T, disablePerDayIndex bool) {
 // The function is not a part of Storage because it is currently used in unit
 // tests only.
 func testSearchMetricIDs(s *Storage, tfss []*TagFilters, tr TimeRange, maxMetrics int, deadline uint64) []uint64 {
-	search := func(qt *querytracer.Tracer, idb *indexDB, tr TimeRange) (*uint64set.Set, error) {
-		return idb.searchMetricIDs(qt, tfss, tr, maxMetrics, deadline)
+	search := func(_ *querytracer.Tracer, idb *indexDB, tr TimeRange) (*uint64set.Set, error) {
+		return idb.searchMetricIDs(tfss, tr, maxMetrics, deadline)
 	}
 	merge := func(data []*uint64set.Set) *uint64set.Set {
 		all := &uint64set.Set{}

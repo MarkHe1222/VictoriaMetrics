@@ -2253,3 +2253,61 @@ func TestIndexSearchLegacyContainsTimeRange_Concurrent(t *testing.T) {
 		t.Fatalf("unexpected min timestamp: got %v, want %v", time.UnixMilli(got).UTC(), time.UnixMilli(want).UTC())
 	}
 }
+
+func (db *indexDB) searchMetricIDs(tfss []*TagFilters, tr TimeRange, maxMetrics int, deadline uint64) (*uint64set.Set, error) {
+	is := db.getIndexSearch(deadline)
+	defer db.putIndexSearch(is)
+
+	dmis := db.getDeletedMetricIDs()
+
+	if tr == globalIndexTimeRange {
+		metricIDs, err := is.searchMetricIDsWithFiltersOnDate(nil, tfss, globalIndexDate, maxMetrics)
+		if err != nil {
+			return nil, err
+		}
+		metricIDs.Subtract(dmis)
+		return metricIDs, nil
+	}
+
+	minDate, maxDate := tr.DateRange()
+	numDays := maxDate - minDate + 1
+
+	if numDays == 1 {
+		metricIDs, err := is.searchMetricIDsWithFiltersOnDate(nil, tfss, minDate, maxMetrics)
+		if err != nil {
+			return nil, err
+		}
+		metricIDs.Subtract(dmis)
+		return metricIDs, nil
+	}
+
+	wg := getWaitGroup()
+	var errGlobal error
+	all := &uint64set.Set{}
+	var mu sync.Mutex
+	for date := minDate; date <= maxDate; date++ {
+		wg.Go(func() {
+			is := db.getIndexSearch(deadline)
+			defer db.putIndexSearch(is)
+			metricIDs, err := is.searchMetricIDsWithFiltersOnDate(nil, tfss, date, maxMetrics)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil && errGlobal == nil {
+				errGlobal = err
+			}
+			if errGlobal != nil {
+				return
+			}
+			all.Union(metricIDs)
+		})
+	}
+	wg.Wait()
+	putWaitGroup(wg)
+
+	if errGlobal != nil {
+		return nil, errGlobal
+	}
+
+	all.Subtract(dmis)
+	return all, nil
+}
