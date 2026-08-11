@@ -667,16 +667,10 @@ func (is *indexSearch) getLabelNamesForMetricIDs(qt *querytracer.Tracer, metricI
 		lns["__name__"] = struct{}{}
 	}
 
-	dmis := is.db.getDeletedMetricIDs()
-
 	var mn MetricName
 	foundLabelNames := 0
 	var buf []byte
 	for _, metricID := range metricIDs {
-		if dmis.Has(metricID) {
-			// skip deleted IDs from result
-			continue
-		}
 		var ok bool
 		buf, ok = is.searchMetricNameWithCache(buf[:0], metricID)
 		if !ok {
@@ -912,15 +906,10 @@ func (is *indexSearch) getLabelValuesForMetricIDs(qt *querytracer.Tracer, labelN
 	}
 
 	lvs := make(map[string]struct{})
-	dmis := is.db.getDeletedMetricIDs()
 	var mn MetricName
 	foundLabelValues := 0
 	var buf []byte
 	for _, metricID := range metricIDs {
-		if dmis.Has(metricID) {
-			// skip deleted IDs from result
-			continue
-		}
 		var ok bool
 		buf, ok = is.searchMetricNameWithCache(buf[:0], metricID)
 		if !ok {
@@ -1293,6 +1282,7 @@ func (is *indexSearch) getTSDBStatus(qt *querytracer.Tracer, tfss []*TagFilters,
 	ts := &is.ts
 	kb := &is.kb
 	mp := &is.mp
+	// TODO: may not be needed anymore, since `filter` metricIDs do not have dmis.
 	dmis := is.db.getDeletedMetricIDs()
 	thSeriesCountByMetricName := newTopHeap(topN)
 	thSeriesCountByLabelName := newTopHeap(topN)
@@ -1517,7 +1507,7 @@ func (db *indexDB) DeleteSeries(qt *querytracer.Tracer, tfss []*TagFilters, maxM
 	// Unconditionally search global index since a given day in per-day
 	// index may not contain the full set of metricIDs that correspond
 	// to the tfss.
-	metricIDs, err := is.searchMetricIDs(qt, tfss, globalIndexTimeRange, maxMetrics)
+	metricIDs, err := is.searchMetricIDsWithFiltersOnDate(qt, tfss, globalIndexDate, maxMetrics)
 	if err != nil {
 		return nil, db.wrapError("delete series", err)
 	}
@@ -1742,18 +1732,12 @@ func (db *indexDB) searchTSIDsWithFiltersOnDate(qt *querytracer.Tracer, tfss []*
 		return nil, err
 	}
 
-	dmis := db.getDeletedMetricIDs()
-
 	tsids := make([]TSID, metricIDs.Len())
 	metricIDsToDelete := &uint64set.Set{}
 	i := 0
 	paceLimiter := 0
 	metricIDs.ForEach(func(metricIDs []uint64) bool {
 		for _, metricID := range metricIDs {
-			if dmis.Has(metricID) {
-				continue
-			}
-
 			if paceLimiter&paceLimiterSlowIterationsMask == 0 {
 				if err = checkSearchDeadlineAndPace(deadline); err != nil {
 					return false
@@ -1890,8 +1874,6 @@ func (db *indexDB) searchMetricNamesWithFiltersOnDate(qt *querytracer.Tracer, tf
 		return nil, err
 	}
 
-	dmis := db.getDeletedMetricIDs()
-
 	metricNames := make([]string, 0, metricIDs.Len())
 	metricIDsToDelete := &uint64set.Set{}
 	var metricName []byte
@@ -1899,10 +1881,6 @@ func (db *indexDB) searchMetricNamesWithFiltersOnDate(qt *querytracer.Tracer, tf
 	paceLimiter := 0
 	metricIDs.ForEach(func(metricIDs []uint64) bool {
 		for _, metricID := range metricIDs {
-			if dmis.Has(metricID) {
-				continue
-			}
-
 			if paceLimiter&paceLimiterSlowIterationsMask == 0 {
 				if err = checkSearchDeadlineAndPace(deadline); err != nil {
 					return false
@@ -2248,7 +2226,14 @@ func isSingleMetricNameFilter(tfss []*TagFilters) bool {
 	return len(tfss) == 1 && len(tfss[0].tfs) == 1 && getMetricNameFilter(tfss[0]) != nil
 }
 
+// searchMetricIDsWithFiltersOnDate searches metricIDs with given tag filters on
+// a given date.
+//
+// The metricIDs that have been previously deleted with DeleteSeries() are
+// removed from the result.
+//
 // TODO: convert to idb method
+// TODO: sort the result?
 func (is *indexSearch) searchMetricIDsWithFiltersOnDate(qt *querytracer.Tracer, tfss []*TagFilters, date uint64, maxMetrics int) (*uint64set.Set, error) {
 	if len(tfss) == 0 {
 		return nil, nil
@@ -2280,28 +2265,12 @@ func (is *indexSearch) searchMetricIDsWithFiltersOnDate(qt *querytracer.Tracer, 
 	if err != nil {
 		return nil, err
 	}
-	// Store metricIDs in the cache.
-	is.db.putMetricIDsToTagFiltersCache(qt, metricIDs, tfKeyBuf.B)
 
-	return metricIDs, nil
-}
-
-// searchMetricIDs returns metricIDs for the given tfss and tr.
-//
-// The returned metricIDs are sorted.
-func (is *indexSearch) searchMetricIDs(qt *querytracer.Tracer, tfss []*TagFilters, tr TimeRange, maxMetrics int) (*uint64set.Set, error) {
-	metricIDs, err := is.searchMetricIDsInternal(qt, tfss, tr, maxMetrics)
-	if err != nil {
-		return nil, err
-	}
-	if metricIDs.Len() == 0 {
-		// Nothing found
-		return nil, nil
-	}
-
-	// Filter out deleted metricIDs.
 	dmis := is.db.getDeletedMetricIDs()
 	metricIDs.Subtract(dmis)
+
+	// Store metricIDs in the cache.
+	is.db.putMetricIDsToTagFiltersCache(qt, metricIDs, tfKeyBuf.B)
 
 	return metricIDs, nil
 }
